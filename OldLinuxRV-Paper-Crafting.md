@@ -549,6 +549,8 @@ x86-64中, 中断门和陷阱门引入了IST位, 它可以无条件的进行栈�
 
 x86中中断指向一个中断向量表, 当发生对应中断时, 会转跳到对应地址去执行。
 
+x86还有一种门叫调用门(call gate), 它被设计为允许低特权级安全的请求高特权级服务。部分Linux版本设置了lcall7和lcall27调用门, 但Linux仅用它执行对BSD和Solaris的二进制仿真。本文并不讨论调用门。
+
 
 
 #### x86 Linux中有关门的术语
@@ -663,11 +665,27 @@ $$
 
 
 
+### fork后子新进程的Entry Path and Exit Path
+
+fork后新的子进程在第一次背调度器选中并调度时是特殊的。总的来说, fork后新的子进程Entry Path and Exit Path模拟了其父进程的过程。我们以进入Entry Path前、do fork、退出Exit Path后三个时间点。
+
+早期Linux中, 从进入路径来看, fork的子进程没有进入路径。 它直接复制了其父亲进程进入Entry Path前的状态, 而忽略其父亲进程进入Entry Path到do fork之间的状态。这个时期的fork的子进程也无需退出路径, 它会直接返回到退出Exit Path后这个时间点。 从进程视角看, 这仅是发出fork系统调用而进入Entry Path的后一时刻。
+
+现代Linux的fork后的子进程不能这样做。所有可能被调度的进程在它背调度切换到指令流的那一刻, 都需要检查是否要移除将控制器交给它的进程是否处于需要被清理并移除的状态 [^WBL]。于是, 现代Linux为fork后的子进程添加了一个特殊的Exit Path, 即`ret_from_fork`。但fork后的子进程依旧不存在entry path, 所以在do fork时, 改为复制刚刚进入Entry Path后的父进程状态。
+
+
+
+
+
 ### pt_regs在Entry Path and Exit Path中的作用
 
 `struct pt_regs`是用于实现ptrace系统调用的数据结构。从Linux 0.01 ~ Linux 0.12, ptrace系统调用属于未实现的状态。ptrace系统调用从0.95开始正式实装, 这也正是Linux在x86体系中统一了系统调用、异常与中断发生时栈内的顺序。
 
 现代Linux为了实现内核核心代码与体系结构的解耦, `struct pt_regs`是特定于体系结构的[^06]P52。在系统系统调用、异常与中断发生的C语言代码中, 实际上传递的就是`struct pt_regs`。新架构的移植很大程度上依赖于这些类似`struct pt_regs`结构体和函数。它们使现代的Linux系统框架化, 且易于移植。
+
+
+
+
 
 
 
@@ -681,9 +699,9 @@ C库会在当需要用户态代码参与内核的重入时起作用。至于用�
 
 ## Context Switch
 
-### 多核处理器对上下文切换的影响
+### current在上下文切换中的作用
 
-Linux内核用名为`current`的变量/宏/函数来获取当前进程描述符, 它在两个进程上下文切换中起到了关键作用。
+Linux内核用名为`current`的变量/宏/函数来直接或间接获取当前CPU上的当前进程描述符, 它在两个进程上下文切换中起到了关键作用。
 
 在单CPU系统中这可以通过在内存中设置一个全局`current`变量来实现。多核系统中, 一个简单的实现方式则是在`per_CPU`( 每CPU变量, 具体实现方式不多赘述 )中存放一个`current`变量。`per_CPU`实现依赖于对当前代码所运行的CPU的标识。对于可以获取当前CPU标识的体系结构来说, 这并不困难。但对于不对系统暴露当前CPU的标识的体系结构来说, 仍然需要一个变量来存储当前CPU的标识, 且这个标识显然不可能存放在`per_CPU`中。
 
@@ -715,7 +733,455 @@ Linux 0.01~1.00中`switch_to`宏仅用了不到10行内联汇编。能如此简�
 
 
 
+### 进程删除时机与上下文切换的关系
+
+现代Linux中[^05cn]将进程的撤销(Destroying )过程分为了进程终止( Termination )和进程删除( Removal )两个阶段。所有进程的终止都是由`do_fork`函数来处理的, 这个函数并不会删除进程描述符的全部结构。正如我们之前所说, 上下文的切换仰赖进程描述符中的一些结构, 所以进程描述符的彻底删除由调度程序在`switch_to`发生后执行。
+
+早期Linux则无需分开处理, `current`一直在单一的内存全局变量中。因而没有必要标识当前CPU, 自然也不用担心进程描述符所有的内容被清空。
+
+
+
+### 浮点寄存器的上下文切换
+
+不是所有体系结构都支持浮点操作。同时部分架构也不仅只有浮点寄存器需要保存与恢复, 例如x86-32中除了FPU外还有MMX和SSE/SSE2单元。我们仅用浮点寄存器的上下文保存与恢复来说明一个通用的思路。
+
+同时, Linux也能支持模拟这些非常规指令的软件方式。Linux 0.11中便加入了数学协处理器软件模拟的代码, 在此本文不讨论软件模拟的情况。
+
+以fpu为例, 总的来说, fpu的上下文处理的思路基本一致。仅在必要的时候保存, 仅在必要的时候恢复。不同的体系结构与不同版本的Linux都有着不同的处理方式。
+
+在x86-32中, TSS中留有给i387协处理器的空间。随着改用thread_struct替代TSS结构存储进程上下文, 其上下文空间很自然的移动到了thread.i387字段中( thread是进程描述符中的thread_struct结构体的变量名 )。
+
+各个体系结构中, 有专门的硬件结构用于指示这些类似fpu的处理器的状态, 如果在上下文切换时发现前一进程使用了fpu, 便会在切换过程中保存之前进程fpu的上下文。
+
+各体系结构对fpu上下文的恢复的处理则有不同的策略。下面我们分别介绍x86-32、ARM64和RISC-V恢复fpu上下文的策略。
+
+x86-32的策略从早期Linux版本延续至今, 它的策略是将fpu上下文的恢复推迟到下一次进程使用了fpu后。它在切换时设置cr0寄存器的TS位, 这会导致当有进程试图使用fpu时发生`device_not_available`异常。在异常处理程序中, 才会真正恢复当前进程的fpu上下文[^05cn]P117。
+
+ARM64的策略是微微延后fpu的恢复到进程准备返回用户模式的时候。它会在需要恢复时设置thread_info结构体中浮点状态相关的标志位TIF_FOREIGN_FPSTATE, 然后在进程准备返回用户模式时调用对应函数恢复fpu的上下文[^07]P71。
+
+RISC-V的恢复策略最为直接, 如果发现被切换的下一个进程有fpu不关闭禁用fpu, 就为下一进程恢复fpu的上下文。
+
+
+
+### fork后新的子进程的上下文
+
+我们在上一章中讨论过这个问题的一部分[^WBL]。
+
+在依旧使用TSS作为进程切换主要手段的Linux版本和现代Linux有着明显的不同。 以Linux 0.12为例, 在do_fork的核心copy_process中, 会刚进入entry path所保存的进入entry path之前的状态存入TSS中 ( 实际上还有修改返回值的过程 )。正如我们之前所说, 在新fork生成的进程第一次被调度时, 会回到用户态中进入entry path之前状态的下一条代码。
+
+但由于现代Linux中不使用TSS, 同时添加了`ret_from_fork`的退出路径, 所以要在新fork生成时模拟它进入了系统调用的状态。调用copy_thread利用刚进入内核时所保存的pt_regs来初始化子进程的内核栈( 并修改其中作为返回值的部分 )[^05cn]P125, 因为exit path需要利用内核栈上的这些值来退出。
+
+同时, 还需要模拟被切换上下文的状态, 通过新fork出的子进程的thread_struct结构体中的相应寄存器, 将`ret_from_fork`设为子进程的函数返回地址。这样, 当switch_to第一次切换到这个进程时, 就会转跳到`ret_from_fork`执行退出路径。
+
+
+
 ## Kernel and Process Initialization
+
+### 进程描述符和内核栈关系的演变
+
+Linux中, 进程描述符和内核栈始终保持着紧密的关系。
+
+第一阶段, 进程描述符和内核栈在连续的物理空间的两端。例如, Linux 0.01~Linux0.98中, 进程描述符和内核栈处于同一个4KiB页的两端。
+
+第二阶段, 进程描述符通过自身元素指向内核栈。例如Linux 0.98.6~1.00中, 进程描述符位于一个4KiB的页中, 进程描述符中的kernel_stack_page==成员==指向一个单独的4KiB的内核栈。==(记得全文统一格式!!!!!!!!!)==
+
+第三阶段, 将内核栈和thread_info结构体放置在连续的物理空间的两端[^05cn] P90。此时current会指向的是thread_info, thread_info中的task指向进程描述符, 进程描述符中的thread_info又指向thread_info而间接的指向了栈。
+
+如2.6的x86-32中, 内核栈和thread_info结构体放置在8KiB的两页中, thread_union共用体定义如下。
+
+```c
+union thread_union {
+	struct thread_info thread_info;
+	unsigned long stack[THREAD_SIZE/sizeof(long)];
+};
+```
+
+第四阶段, 引入了新的thread_info布局。 可以通过设置`CONFIG_THREAD_INFO_IN_TASK`将结构体 thread_info设为是进程描述符的第一个成员而不将其放在内核栈中。但无论哪种布局, 进程描述符中的stack元素指向内核栈(指向内核栈所处内存空间的地址最低端, 例如不定义`CONFIG_THREAD_INFO_IN_TASK` 时本质上还是指向了thread_info ) [^07] P26。
+
+例如, 4.12的ARM64 Linux使用将thread_info设为是进程描述符的第一个成员的布局, thread_union共用体定义如下。
+
+```c
+<include/linux/sched.h>
+union thread_union {
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	struct thread_info thread_info; 
+#endif
+	unsigned long stack[THREAD_SIZE/sizeof(long)]; 
+};
+```
+
+第五阶段, 将进程描述符和内核栈放置在连续的物理空间的两端成为一个可由`CONFIG_ARCH_TASK_STRUCT_ON_STACK`配置选项。例如, 可以从4.18.0版本的thread_union共用体定义看出: 
+
+```c
+union thread_union {
+#ifndef CONFIG_ARCH_TASK_STRUCT_ON_STACK
+	struct task_struct task;
+#endif
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	struct thread_info thread_info;
+#endif
+	unsigned long stack[THREAD_SIZE/sizeof(long)];
+};
+```
+
+第六阶段,进程描述符和内核栈放置在连续的物理空间的两端重新变为不可配置的布局方式。例如, 6.8版本的thread_union共用体定义: 
+
+```c
+union thread_union {
+	struct task_struct task;
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	struct thread_info thread_info;
+#endif
+	unsigned long stack[THREAD_SIZE/sizeof(long)];
+};
+```
+
+需要说明的是, 无论哪种布局方式, 进程描述符中的`kernel_stack_page`, `thread_info` 或 `stack`成员都指向的是栈所在空间的低端地址。在初始化内核栈时, 本质上是使用, 如6.8中RISC-V的初始化进程0的进程描述符和内核栈时:
+
+```c
+la tp, init_task
+la sp, init_thread_union + THREAD_SIZE
+```
+
+其中, 进程0的thread_union, 即init_thread_union, 隐式地通过链接脚本(linux/include/asm-generic/vmlinux.lds.h)和进程0的进程描述符init_task指向同一地址:
+
+```c
+#define INIT_TASK_DATA(align)						\
+	. = ALIGN(align);						\
+	__start_init_task = .;						\
+	init_thread_union = .;						\
+	init_stack = .;							\
+	KEEP(*(.data..init_task))					\
+	KEEP(*(.data..init_thread_info))				\
+	. = __start_init_task + THREAD_SIZE;				\
+	__end_init_task = .;
+```
+
+同样也能通过以下这段代码看出: ==别写进论文!!!==
+
+```c
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+# define task_thread_info(task)	(&(task)->thread_info)
+#elif !defined(__HAVE_THREAD_FUNCTIONS)
+# define task_thread_info(task)	((struct thread_info *)(task)->stack)
+#endif
+```
+
+
+
+### 内核与进程0的初始化
+
+#### 内核与进程0的关系
+
+所有进程的祖先叫进程0( process 0 ), idle进程( idle process )或因历史原因称为swapper进程( swapper process )。它是Linux在初始化阶段从无到有创建的进程。无论是早期Linux还是现代Linux中, 这个祖先进程都是特别的。它使用的很多数据结构都是静态分配的, 而所有其他进程/线程的数据结构都是动态分配的。
+
+内核的代码从head.S开始, 一些体系结构在head.S前还会有一些额外的工作需要做, 本文不讨论这种情况。
+
+如果用现代Linux的术语来分析内核与0号进程的关系, 我们会称0号进程是一个内核线程( kernel thread )。它会分支出其他的内核线程, 其他的内核线程进一步分支出用户态进程。因此我们不难讲整个操作系统运行流程分为3个部分: 内核服务, 内核任务和用户态任务。内核线程在内核服务, 内核任务两者中切换。用户进程在内核服务和用户态任务中切换。内核在进入head.S的执行流后不久便会将进程0的相关数据结构安置妥当, 在此之后的内核初始化指令流本质上就是进程0的内核服务的代码。
+
+早期Linux中情况会变得复杂。第一、早期内核不存在内核线程的概念, 进程0是用户态进程。第二、内核流执行一段时间后才会装载进程0的相应数据结构。三、从线性地址的角度看, 内核执行流和进程0的用户态执行流是紧密接续的。从内核执行流到进程0用户态执行流的切换是通过切换x86-32段选择子来完成的。这导致了在除了用户态进程的内核服务和用户态任务执行流之外, 还有一段无法被忽视的, 仅属于内核程序初始化的执行流。
+
+严谨的说, 现代内核也有这么一段仅属于内核初始化程序的执行流。但是这段执行流通常很短, 且用不依赖于栈的汇编语言编写。
+
+
+
+#### 内核与进程0的栈
+
+理论上不同的C语言运行环境依赖于不同的栈。正如我们之前在“中断与异常时栈的切换”一节讨论的一样, 我们仅讨论导论因权级不同而导致C语言运行环境不同的内核栈和用户栈。
+
+从进程角度来看, 每个进程的进程描述符中都有自己的内核栈和用户栈字段。每个进程的内核栈和其进程描述符紧密联系, 因此, 每个进程的内核栈也和它的进程描述符一样具有唯一性这一点我们稍后说明[^WBL]。用户栈则仅能保证进程描述符里有它的字段。不同进程描述符的用户栈可能指向不同的地址空间, 也有可能因为clone的原因指向同一地址空间的引用, 还有可能是内核线程而不使用内核栈。
+
+不考虑进入head.S之前可能使用的代码和栈。早期Linux有3种栈, 内核初始化使用的栈、用户态栈和内核态栈。而现代内核只有用户态栈和内核态栈。
+
+Linux 0.01~1.00有3种栈, 并将内核初始化使用的栈作为进程0的用户栈。这样做的原因是两者的执行流的线性地址上看是连续的, 只用切换栈的段选择子即可继续运行。
+
+无论是早期Linux还是现代Linux, 进程0的内核栈都是特殊的。正如前文所说, 它们都是系统通过`TASK_INIT`等一些列宏设置出来的。
+
+余下其他所有进程的栈则依赖内核的其他机制来处理, 初始化过程不用再为其操心了。
+
+![进程栈的分配过程.drawio](./asset/进程栈的分配过程.drawio.png)
+
+#### ~~6.8中RISC-V与ARM64在初始化内核栈上的对比 (不写入论文)~~
+
+在[v6.5-rc1](https://github.com/torvalds/linux/releases/tag/v6.5-rc1)中的[commit c7cdd96](https://github.com/torvalds/linux/commit/c7cdd96eca2810f5b69c37eb439ec63d59fa1b83)中, Linux RV以非常随意的理由在内核栈上留出了一个PT_SIZE_ON_STACK的空间。
+
+ARM64在初始化时也留有一个PT_REGS_SIZE大小, 以6.8中的代码为例:
+
+```c
+SYM_CODE_END(preserve_boot_args)
+
+	/*
+	 * Initialize CPU registers with task-specific and cpu-specific context.
+	 *
+	 * Create a final frame record at task_pt_regs(current)->stackframe, so
+	 * that the unwinder can identify the final frame record of any task by
+	 * its location in the task stack. We reserve the entire pt_regs space
+	 * for consistency with user tasks and kthreads.
+	 */
+	.macro	init_cpu_task tsk, tmp1, tmp2
+	msr	sp_el0, \tsk
+
+	ldr	\tmp1, [\tsk, #TSK_STACK]
+	add	sp, \tmp1, #THREAD_SIZE
+	sub	sp, sp, #PT_REGS_SIZE
+
+	stp	xzr, xzr, [sp, #S_STACKFRAME]
+	add	x29, sp, #S_STACKFRAME
+
+	scs_load_current
+
+	adr_l	\tmp1, __per_cpu_offset
+	ldr	w\tmp2, [\tsk, #TSK_TI_CPU]
+	ldr	\tmp1, [\tmp1, \tmp2, lsl #3]
+	set_this_cpu_offset \tmp1
+	.endm
+```
+
+但其明确说明了这个PT_REGS_SIZE是为了winder追踪内核所用的。
+
+相较之下, RISC-V的理由显得过于随意。
+
+
+
+
+
+### 分页机制的初始化
+
+分页机制的初始化与系统结构和内存管理策略息息相关。初始化阶段涉及到两个重要映射机制, 恒等映射(identity mapping)和直接映射(direct mapping)。请注意直接映射和固定映射(fix-map)的区别, 它们都是偏移固定常量的线性映射。直接映射线性偏移量通常在编译内核时就已经确定, 且常常与体系结构相关。直接映射的虚拟地址和物理地址在内核生命周期中永远存在且保持一致, 通过`__pa(vaddr)`和`__va(paddr)`相互转化[^06] P142。固定映射的线性偏移量不是预设的, 且固定映射本身可以被动态的创建和销毁。
+
+恒等映射往往用于内核初始化阶段的过渡, 当这种映射不再必要时, 内核会清除对应的页表项[^05cn] P76。恒等映射也不是必须建立的,  6.8版本的RISC-V Linux就没有建立恒等映射, 而是用异常转跳的方式完成的过渡。
+
+下面具体说明一些例子:
+
+Linux 0.01 ~ Linux 1.00中:
+
+0.01~0.97版本中, 会做机器内存大小的恒等映射。因为此时内核的起点在线性地址和逻辑地址的0x00000000处。如果机器安装了更大的物理内存, 则需要手动更改内核源码设置更多的页表来初始化。
+
+0.97.6和0.98中, 仅做内核前4MiB的恒等映射, 与机器内存大小的直接映射。这4MiB内存已经包含了内核所有的代码部分。直接映射部分则同理, 如果机器安装了更大的物理内存要修改内核源代码以适应。
+
+0.98.6~1.00中, 仅做内核前4MiB的恒等映射和直接映射, 随后内核会在`paging_init`函数中映射所有机器物理内存。
+
+Linux 2.6版本的x86-32中, 会做内核前8MiB的恒等映射和直接映射。此时要求内核使用的段、临时页表和用于存放动态数据结构的128KiB都能被容纳于这8MiB空间里[^05cn] P74。
+
+Linux ARM (不是ARM64)中(到当前6.8版本都遵循), 会恒等映射head.S中的一小部分代码和直接映射内核部分。恒等映射部分从head.S中`__enable_mmu`到`__turn_mmu_on`, 其中的代码负责开启内存管理单元[^07] P10。
+
+Linux RISC-V中(到当前6.8版本都遵循)没有恒等映射。其他体系结构中恒等映射的部分被`trampoline_pg_dir`页表和异常处理的转跳机制的配合所替代, `trampoline_pg_dir`中只有直接映射。这套机制同时被用于多核启动或CPU热插拔的启动。此外, 除了体系结构无关的`swapper_pg_dir`外, RISC-V还创建了一个静态分配的`early_pg_dir`供(主)启动核使用。`early_pg_dir`会在`setup_bootmem()`探明内存后被`setup_vm_final`函数融入`swapper_pg_dir`中[^18]。
+
+
+
+### fork中新进程的初始化
+
+Linux0.01~1.00中, fork系统调用全部由sys_fork进行。Linux 1.00中加入了sys_clone, 它本质上是`#define sys_clone sys_fork`。
+
+6.8版本中, 所有与fork行文相关的系统调用, 最终都由父进程的kernel_clone函数执行, 区别仅是传递给kernel_clone的参数不同。进程会经过一系列数据结构的初始化, 并最终在kernel_clone所调用的wake_up_new_task唤醒开始正式开始执行。
+
+#### 进程描述符的初始化
+
+(2.6之类的之后再考古吧, 也可能不考了)
+
+Linux0.01~1.00中, 包含进程描述符的初始化的整个fork过程都在sys_fork函数中进行。6.8版本Linux的进程描述符的创建由kernel_clone中的copy_process完成。
+
+#### 内核栈的创建
+
+前文描述了内核栈和进程描述符的关系。
+
+Linux 0.01~Linux0.98中, 进程描述符和内核栈在连续的物理空间的两端, 在分配进程描述符空间时, 栈的空间也就同时被分配了。
+
+Linux 0.98.6~1.00中, sys_fork为kernel_stack_page成员分配内核栈空间。
+
+6.8版本中, 不管使用何种布局, 都由copy_process调用的dup_task_struct中的alloc_thread_stack_node进行分配。
+
+#### thread_info的复制
+
+早期Linux没有thread_info结构体。
+
+6.8中由copy_process调用的dup_task_struct中的thread_info的复制由setup_thread_stack完成。此时仅是复制并设置了thread_info相关的结构, 与栈内容的复制无关。
+
+#### 内核栈内容的复制
+
+正如前文所述, 早期Linux不存在内核栈的复制, 因为早期Linux的fork的退出路径返回点是进入fork调用前。而早期Linux规定, 当用户态切换为内核态时, 内核栈是空的, 所以并没有复制过程。(注意, 早期Linux会对进程描述符结构体进行复制, 在这个过程中, 不会复制内核栈, 这是C语言共用体的语法决定的)
+
+现代Linux的新进程内核栈的设置在copy_process中的copy_thread中完成, 其复制了父进程内核栈上最先入栈的pt_regs结构体到自己的内核栈中。
+
+#### 内核栈的初始化
+
+早期Linux复制父亲进程TSS的内容到子进程的TSS中, 通过设置子进程上下文的方式设置了用户栈的位置。
+
+现代Linux的用户栈的引用的复制也在copy_process中完成。如果是用户态进程, 现代Linux中父亲进程的用户栈显然包含在内核栈上最先入栈的pt_regs结构体中, 在copy_thread中已经复制。内核线程不使用用户态内存空间, 自然不使用用户栈, 在fork时也不会为子进程分配用户栈。
+
+以上操作都是复制栈的引用, 栈空间的真正分配则要留到返回用户态后, COW写时复制机制为第一个像栈空间写的进程分配新的栈内存空间。
+
+#### 子进程执行流的初始化
+
+正如前文所述, 早期Linux和现代Linux在fork后新进程的Exit Path上有很大的区别。在此我们仅讨论用户进程的情况。早期Linux用TSS直接设置, 而现代Linux则是在copy_thread中将pc设置为ret_from_fork, 栈指针设置为其自己栈中所复制的pt_regs结构体的位置上。
+
+
+
+### execve中新程序的初始化
+
+本文此阶段仅讨论体系结构相关的问题。因此对execve的讨论仅限于对其运行最基本环境的设置。将中断使能设置好, 将pc寄存器设置好, 将栈设置好。如有FPU之类的, 根据体系结构的不同完成对FPU等设备的初始化。
+
+
+
+### fork与execve在早期Linux中对段机制的初始化
+
+在Linux0.01~1.00期间, 进程0, 即init_task在段机制上与其他进程有所区别。fork与execve参与了各子进程段机制的初始化。
+
+```
+# Linux 0.01 ~ Linux 0.99 中研究用户态进程起点与范围的主要相关函数/宏名
+
+1、只列出了主要相关函数/宏的函数/宏名
+2、函数/宏的参数可能在各个版本中有变化
+
+sys_fork
+	└── copy_process
+				└── copy_mem
+							└── set_base
+							
+sys_execve
+	└── do_execve
+				└── change_ldt
+							├── set_base
+							└── set_limit
+```
+
+Linux0.01 ~ 0.99的init_task的段限长都是640KiB。
+
+首先要说明的是`set_base`和`set_limit`都只更改对应表项的对应部分。例如, 在`copy_mem`中调用`set_base`时, 对应表项的原limit属性并没有改变。
+
+- Linux 0.01、0.10、0.11
+
+  在`copy_mem`中调用`set_base`宏设置fork出的子进程的base为`nr * 0x4000000` ( 64MiB )。
+
+  在`change_ldt`中依据传入的`text_size`参数用`set_limit`宏设置代码段限长, 并将数据段长度设为`0x4000000` ( 64MiB )。虽然调用了`set_base`但是实际没有改变当前进程的base参数。
+
+- Linux 0.12、0.95、0.96c、0.97
+
+  引入了`TASK_SIZE`宏, 此时的`TASK_SIZE`宏为`0x4000000` ( 64MiB )。
+
+  在`copy_mem`中调用`set_base`设置fork出的子进程的base为`nr * TASK_SIZE`。( 仅引入了宏, 本质与Linux 0.01、0.10、0.11没有区别 )
+
+  在`change_ldt`函数保留了`text_size`参数, 但未在函数体内使用。使用`set_limit`宏同时设置代码段限长和数据段限长为`TASK_SIZE`。虽然调用了`set_base`但是实际没有改变当前进程的base参数。
+
+- Linux 0.97.6、0.98、0.98.6、0.99
+
+  此时的`TASK_SIZE`宏为`0xC0000000` ( 3GiB )。
+
+  在`copy_mem`中调用`set_base`设置fork出的子进程的base为0。
+
+  在`change_ldt`函数保留了`text_size`参数, 但未在函数体内使用。使用`set_limit`宏同时设置代码段限长和数据段限长为`TASK_SIZE`。虽然调用了`set_base`但是实际没有改变当前进程的base参数。
+
+- Linux 1.00
+
+  Linux 1.00使用了GDT中的表项作为自己的段描述符, 其数据段和代码段限长应该都是3GiB。尽管在Linux 1.00的`INIT_TASK`前的注释中写道`Base=0, limit=0x1fffff (=2MB)`, 但是从具体使用的段选择子来看, init_task数据段和代码段限长应为3GiB。
+
+
+
+### 进程目标处理器的初始化
+
+(之后再慢慢补充吧)
+
+早期Linux是单核的, 现代Linux中不同架构中对进程的目标处理器初始化在具体细节上也各有千秋。所以我们仅讨论现代的通用思想和RISC-V的一些细节。Linux内核在调度等问题上使用是cpuid, 它是与处理器实际的编号无关的。Linux会维护一份cpuid和处理器实际编号的相互映射关系, 在RISC-V中, 这个映射就是cpuid和hartid的相互映射
+
+#### 进程0目标处理器的初始化
+
+在系统启动时, 第一个开始启动的处理器会被内核映射为cpuid为0。内核将在这个处理器上运行进程0。
+
+参考[^18], 在现在的RISC-V系统上, 有两种进入内核的方式。如果使用`RISCV_BOOT_SPINWAIT`方式启动, 意味着硬件将一次性释放所有hart开始运行内核代码。此时通过在内核初始化流程中通过原子指令来选中一个核作为启动核, 其他和在某个symbol处不停spin等待被启动核放行。`Ordered booting`方式下, 硬件仅会释放一个核用于执行初始化流程。其他核通过SBI的HSM扩展进行启动, 这意味着内核将支持处理器的热插拔。
+
+#### idle线程的初始化
+
+进程0是第一个idle线程, 其他处理器的idle线程都将由它分叉产生。启动处理器会探测其他处理器的存在, 并以适当方式在它们上面初始化并运行每个处理器的idle线程。在初始化idle线程时, 便会设置好其目标处理器为当前运行的处理器。idle线程的目标处理器不会改变, 除非idle线程所在运行的处理器被热插拔卸载。
+
+RISC-V通过devicetree or ACPI tables来探知其他CPU的存在。==.............困的不行了, 反正论文里也不会写这个, 之后再来补吧。==在https://github.com/torvalds/linux/blob/master/arch/riscv/kernel/smpboot.c里。
+
+#### 其他进程的目标处理器设置
+
+进程的cpuid往往被放置在thread_info的cpu成员中。一个新的进程第一次被设置目标处理器是在fork行为时的copy_process中通过对thread_info结构体的复制完成的。但由copy_process所复制出来的目标处理器不会维持太久。内核会为了实现负载均衡在fork/clone行为和execve装载程序时进行负载均衡, 这个过程中内核调度的核心代码(linux/kernel/sched/core.c)中的wake_up_new_task和sched_exec会为进程重新安排目标处理器。
+
+
+
+#### ~~RISC-V曾经在上下文切换中显式的切换thread_info::cpu~~
+
+见https://github.com/torvalds/linux/commit/8aa0fb0fbb82a4d2395be7eaeb994653b2d869fc 
+
+==论文中别出现这个。==
+
+但我们估计会采用这个方案, 因为我不打算实现复杂的调度。
+
+
+
+#### cpuid与hartid的映射
+
+hartid与Linux内部cpuid有一组映射关系。
+
+CPUID 到 HARTID 的映射由`cpuid_to_hartid_map()`提供。HARTID 到 CPUID 的映射由`riscv_hartid_to_cpuid();`提供。
+
+他们的核心是`__cpuid_to_hartid_map`数组 (在https://github.com/torvalds/linux/blob/master/arch/riscv/include/asm/smp.h中)。
+
+```c
+/*
+ * Mapping between linux logical cpu index and hartid.
+ */
+extern unsigned long __cpuid_to_hartid_map[NR_CPUS];
+#define cpuid_to_hartid_map(cpu)    __cpuid_to_hartid_map[cpu]
+```
+
+它在https://github.com/torvalds/linux/blob/master/arch/riscv/kernel/smp.c被初始化为全-1。
+
+```c
+unsigned long __cpuid_to_hartid_map[NR_CPUS] __ro_after_init = {
+	[0 ... NR_CPUS-1] = INVALID_HARTID
+};
+```
+
+其中有一对使用`static inline`声明的函数, 他们用于单核的情况。其中`boot_cpu_hartid`在启动时被设置(head.S ), 它也是启动所使用的hart的hartid。任何CPUID都会映射到`boot_cpu_hartid`  (在https://github.com/torvalds/linux/blob/master/arch/riscv/include/asm/smp.h中)。
+
+```c
+static inline int riscv_hartid_to_cpuid(unsigned long hartid)
+{
+	if (hartid == boot_cpu_hartid)
+		return 0;
+
+	return -1;
+}
+static inline unsigned long cpuid_to_hartid_map(int cpu)
+{
+	return boot_cpu_hartid;
+}
+```
+
+多核的情况下: (https://github.com/torvalds/linux/blob/master/arch/riscv/kernel/smp.c)
+
+```c
+void __init smp_setup_processor_id(void)
+{
+	cpuid_to_hartid_map(0) = boot_cpu_hartid;
+}
+
+int riscv_hartid_to_cpuid(unsigned long hartid)
+{
+	int i;
+
+	for (i = 0; i < NR_CPUS; i++)
+		if (cpuid_to_hartid_map(i) == hartid)
+			return i;
+
+	return -ENOENT;
+}
+```
+
+另一个函数在上方的宏中:
+
+```c
+#define cpuid_to_hartid_map(cpu)    __cpuid_to_hartid_map[cpu]
+```
+
+
+
+
+
+
 
 
 
@@ -729,9 +1195,31 @@ Linux 0.01~1.00中`switch_to`宏仅用了不到10行内联汇编。能如此简�
 
 在这一点上, Linux 1.00已经与后期版本有异曲同工之妙[^05cn] P50。
 
+
+
+
+
+### 分页的实现:
+
+且我们希望使用一个确定大小的空间来完成初始化阶段的分页初始化。
+
+我们将分页机制的初始化分解成2个问题: 是否使用大页(huge page), 是否映射全部的内核代码。
+
+如果我们采取最小颗粒度分页的分页机制, 且只映射部分内核代码。优点在于我们能确定其使用的空间大小。缺点是不一定能保证后期用于将所有内核代码都完成映射的函数也被包括在初始化时的范围内。使用连接脚本将对应代码放在尽量靠前的位置或许能够解决, 但是这会给后续版本迭代的兼容性造成潜在的威胁。
+
+如果我们采取最小颗粒度分页的分页机制, 且映射全部内核代码。优点便是一定能保证内核的安全运行。坏处便是内核使用的页表空间不确定。如果设置一个更大的范围, 来确保内核被包含进去, 则有可能引发浪费。如果直接在连接脚本中计算内核代码大小然后计算则会极为复杂, 更重要的是, 日后迭代中如果引入5级的虚拟页表结构可能会直接使得在编译阶段计算出需要多少页表空间称为不可能。
+
+使用巨页的好处是, 每一个页表项能映射非常大的范围。这个范围远超过内核代码当前和未来可能的大小, 自然能确保内核代码空间全被包含。好处是能使用确定大小的空间完成初始化。坏处是当不实现巨页管理机制时, 映射了巨页的页表可能会被丢弃, 造成浪费。
+
+修改Linux RISC-V的启动流程是一个好方案, `trampoline_pg_dir`被用于多核启动, 它不需要回收, 因为可能涉及到CPU的热插拔, 所以不存在浪费。
+
+然后我们延后设置`swapper_pg_dir`的时机到
+
+
+
 # 废弃的Idea
 
-
+进程所运行的CPU由内核调度的核心代码(linux/kernel/sched/core.c)设置。早期Linux仅支持单核, 所以不存在这个概念。现代Linux的调度子系统是及其强大的, 从RISC-V Linux的注释中我们能看出这个设置过程已经是复制的调度、抢占、负载均衡等机制的一部分。总之, 现代Linux能为子进程设置合适的CPU去运行。
 
 
 
@@ -760,6 +1248,8 @@ Linux 0.01~1.00中`switch_to`宏仅用了不到10行内联汇编。能如此简�
 [^15]: RV非特权级手册
 [^16]: intel有关x86S的宣传 https://www.intel.com/content/www/us/en/developer/articles/technical/envisioning-future-simplified-architecture.html
 [^17]: RISC-V  SBI手册
+
+[^18]: RISC-V Kernel Boot Requirements and Constraints https://github.com/torvalds/linux/blob/master/Documentation/arch/riscv/boot.rst
 
 
 

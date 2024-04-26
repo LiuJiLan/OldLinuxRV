@@ -364,7 +364,7 @@ $$
 
 
 
-### 用户态进程起点与范围代码解释
+### ==用户态进程起点与范围代码解释==
 
 ```
 # Linux 0.01 ~ Linux 0.99 中研究用户态进程起点与范围的主要相关函数/宏名
@@ -384,29 +384,35 @@ sys_execve
 							└── set_limit
 ```
 
-首先要说明的是`set_base`和`set_limit`都只更改对应表项的对应部分。例如, 在`copy_mem`中调用`set_base`时, 对应表项的原limit属性并没有改变。
+==Linux0.01 ~ 0.99的init_task的段限长都是640KiB。==
 
-- Linux 0.01、0.10、0.11
+==首先要说明的是`set_base`和`set_limit`都只更改对应表项的对应部分。例如, 在`copy_mem`中调用`set_base`时, 对应表项的原limit属性并没有改变。==
 
-  在`copy_mem`中调用`set_base`宏设置fork出的子进程的base为`nr * 0x4000000` ( 64MiB )。
+- ==Linux 0.01、0.10、0.11==
 
-  在`change_ldt`中依据传入的`text_size`参数用`set_limit`宏设置代码段限长, 并将数据段长度设为`0x4000000` ( 64MiB )。虽然调用了`set_base`但是实际没有改变当前进程的base参数。
+  ==在`copy_mem`中调用`set_base`宏设置fork出的子进程的base为`nr * 0x4000000` ( 64MiB )。==
 
-- Linux 0.12、0.95、0.96c、0.97
+  ==在`change_ldt`中依据传入的`text_size`参数用`set_limit`宏设置代码段限长, 并将数据段长度设为`0x4000000` ( 64MiB )。虽然调用了`set_base`但是实际没有改变当前进程的base参数。==
 
-  引入了`TASK_SIZE`宏, 此时的`TASK_SIZE`宏为`0x4000000` ( 64MiB )。
+- ==Linux 0.12、0.95、0.96c、0.97==
 
-  在`copy_mem`中调用`set_base`设置fork出的子进程的base为`nr * TASK_SIZE`。( 仅引入了宏, 本质与Linux 0.01、0.10、0.11没有区别 )
+  ==引入了`TASK_SIZE`宏, 此时的`TASK_SIZE`宏为`0x4000000` ( 64MiB )。==
 
-  在`change_ldt`函数保留了`text_size`参数, 但未在函数体内使用。使用`set_limit`宏同时设置代码段限长和数据段限长为`TASK_SIZE`。虽然调用了`set_base`但是实际没有改变当前进程的base参数。
+  ==在`copy_mem`中调用`set_base`设置fork出的子进程的base为`nr * TASK_SIZE`。( 仅引入了宏, 本质与Linux 0.01、0.10、0.11没有区别 )==
 
-- Linux 0.97.6、0.98、0.98.6、0.99
+  ==在`change_ldt`函数保留了`text_size`参数, 但未在函数体内使用。使用`set_limit`宏同时设置代码段限长和数据段限长为`TASK_SIZE`。虽然调用了`set_base`但是实际没有改变当前进程的base参数。==
 
-  此时的`TASK_SIZE`宏为`0xC0000000` ( 3GiB )。
+- ==Linux 0.97.6、0.98、0.98.6、0.99==
 
-  在`copy_mem`中调用`set_base`设置fork出的子进程的base为0。
+  ==此时的`TASK_SIZE`宏为`0xC0000000` ( 3GiB )。==
 
-  在`change_ldt`函数保留了`text_size`参数, 但未在函数体内使用。使用`set_limit`宏同时设置代码段限长和数据段限长为`TASK_SIZE`。虽然调用了`set_base`但是实际没有改变当前进程的base参数。
+  ==在`copy_mem`中调用`set_base`设置fork出的子进程的base为0。==
+
+  ==在`change_ldt`函数保留了`text_size`参数, 但未在函数体内使用。使用`set_limit`宏同时设置代码段限长和数据段限长为`TASK_SIZE`。虽然调用了`set_base`但是实际没有改变当前进程的base参数。==
+  
+- ==Linux 1.00==
+
+  ==Linux 1.00使用了GDT中的表项作为自己的段描述符, 其数据段和代码段限长应该都是3GiB。尽管在Linux 1.00的`INIT_TASK`前的注释中写道`Base=0, limit=0x1fffff (=2MB)`, 但是从具体使用的段选择子来看, init_task数据段和代码段限长应为3GiB。==
 
 
 
@@ -598,7 +604,7 @@ save(REST_Generous_Register)
 
 
 
-# CPU编号
+# ==CPU编号==
 
 hartid与Linux内部cpuid有一组映射关系。
 
@@ -851,7 +857,7 @@ else:
 
 [^17]: RISC-V  SBI手册
 
-
+[^18]: RISC-V Kernel Boot Requirements and Constraints https://github.com/torvalds/linux/blob/master/Documentation/arch/riscv/boot.rst
 
 
 
